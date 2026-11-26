@@ -176,10 +176,12 @@ def get_excited_state_half_lives(levels=None, max_rows=None, *,
             energy_value = energy.get("value")
             energy_unit = energy.get("unit")
         dataset = level.get("datasetSummary")
-        dataset_id = level.get("datasetId")
+        dataset_id = level.get("datasetId", level.get("datasetSummary.id"))
         if isinstance(dataset, dict):
             dataset_id = dataset.get("id")
-        spin_parity = level.get("spinParity")
+        spin_parity = level.get(
+            "spinParity", level.get("spinParity.stringRepresentation")
+        )
         if isinstance(spin_parity, dict):
             spin_parity = spin_parity.get("stringRepresentation")
         rows.append({
