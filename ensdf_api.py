@@ -161,18 +161,26 @@ def get_gamma_energies_intensities(gammas=None, max_rows=None,
 
 
 def get_half_life(nuclide, *, params=None, http_session=None):
-    """Return the half-life only when supplied in the nuclide decay records.
+    """Return an exposed half-life field from the nuclide's decay records.
 
     The API example provided documents the decays route but not a half-life
-    field, so this helper deliberately does not infer a value from level order.
+    field or metastable path syntax, so this helper does not infer either.
     """
     _, _, isomer = parse_nuclide(nuclide)
+    if isomer:
+        raise NotImplementedError(
+            "The API example does not document how to address metastable nuclides"
+        )
     decays = get_decays(nuclide, params=params, http_session=http_session)
     if decays.empty:
         raise LookupError(f"No decay records found for {nuclide}")
-    half_life_fields = ("halfLife", "half-life", "half_life")
-    values = next((decays[field] for field in half_life_fields if field in decays), None)
-    if values is None:
-        raise LookupError("The decay records do not include a documented half-life field")
-    row_index = min(isomer, len(decays) - 1)
-    return values.iloc[row_index]
+    half_life_fields = (
+        "halfLife.value", "half-life.value", "half_life.value",
+        "halfLife", "half-life", "half_life",
+    )
+    for field in half_life_fields:
+        if field in decays:
+            values = decays[field].dropna()
+            if not values.empty:
+                return values.iloc[0]
+    raise LookupError("The decay records do not include a half-life field")

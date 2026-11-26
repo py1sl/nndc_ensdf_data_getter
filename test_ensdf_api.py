@@ -73,6 +73,21 @@ def test_get_decays_uses_nuclide_route_and_results():
     assert kwargs["params"] == {"limit": 200}
 
 
+def test_half_life_reads_api_field_without_assuming_row_order():
+    client = FakeSession({
+        "results": [
+            {"id": "decay-1", "halfLife": {"value": 5.27}},
+            {"id": "decay-2"},
+        ]
+    })
+    assert api.get_half_life("Co60", http_session=client) == 5.27
+
+
+def test_half_life_does_not_guess_metastable_path():
+    with pytest.raises(NotImplementedError, match="metastable"):
+        api.get_half_life("Co60m")
+
+
 def test_request_error_includes_api_response_details():
     client = FakeSession({"detail": "invalid"}, lines=[])
     client.request = lambda *_args, **_kwargs: FakeResponse(
