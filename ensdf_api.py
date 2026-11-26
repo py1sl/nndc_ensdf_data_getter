@@ -1,29 +1,25 @@
-"""Helpers for retrieving nuclear data from the NNDC ENSDF API.
+"""Helpers for retrieving data from the NNDC ENSDF API."""
 
-API documentation: https://www.nndc.bnl.gov/ensdf-api/
-
-The endpoint paths and field names are kept in module-level constants so they
-can be adjusted if the service layout differs.
-"""
+import json
 import re
+from urllib.parse import urljoin
 
 import pandas as pd
 import requests
 
-BASE_URL = "https://www.nndc.bnl.gov/ensdf-api"
-LEVELS_ENDPOINT = "levels"
-GAMMAS_ENDPOINT = "gammas"
-TIMEOUT = 30
+BASE_URL = "https://www.nndc.bnl.gov/ensdf-api/"
+TIMEOUT = 60
+GAMMA_EXPORT_PATH = "/gammas/export"
+GAMMA_EXPORT_PARAMS = {"document-type": "adopted"}
 
 _NUCLIDE_RE = re.compile(r"^\s*(\d+)?\s*([A-Za-z]{1,2})[-\s]?(\d+)?\s*(m\d*)?\s*$")
 
+session = requests.Session()
+session.headers.update({"Accept": "application/json"})
+
 
 def parse_nuclide(name):
-    """Parse e.g. 'Co60', 'Co-60', 'Co60m', '60Co', 'Ag110m2'.
-
-    Returns (symbol, mass_number, isomer_index) where isomer_index is 0 for the
-    ground state, 1 for 'm'/'m1', 2 for 'm2', etc.
-    """
+    """Parse Co60, Co-60, 60Co, Co60m, or Ag110m2."""
     match = _NUCLIDE_RE.match(name)
     if not match:
         raise ValueError(f"Cannot parse nuclide name: {name!r}")
@@ -31,67 +27,152 @@ def parse_nuclide(name):
     mass = mass_prefix or mass_suffix
     if not mass:
         raise ValueError(f"No mass number in nuclide name: {name!r}")
-    isomer = 0
-    if meta:
-        isomer = int(meta[1:]) if len(meta) > 1 else 1
+    isomer = int(meta[1:]) if meta and len(meta) > 1 else int(bool(meta))
     return symbol.capitalize(), int(mass), isomer
 
 
-def _fetch(endpoint, nuclide, session=None):
-    """Request records for a nuclide and return them as a DataFrame."""
-    symbol, mass, _ = parse_nuclide(nuclide)
-    getter = session.get if session is not None else requests.get
-    response = getter(
-        f"{BASE_URL}/{endpoint}",
-        params={"nuc": f"{mass}{symbol}"},
-        timeout=TIMEOUT,
+def api_url(path):
+    """Build an API URL from an absolute- or relative-style API path."""
+    return urljoin(BASE_URL, path.lstrip("/"))
+
+
+def request_json(method, path, *, params=None, json_body=None, timeout=TIMEOUT,
+                 http_session=None):
+    """Make an API request and return its decoded JSON response."""
+    client = http_session or session
+    response = client.request(
+        method,
+        api_url(path),
+        params=params,
+        json=json_body,
+        timeout=timeout,
     )
-    response.raise_for_status()
-    data = response.json()
-    if isinstance(data, dict):
-        for key in ("data", "results", "levels", "gammas"):
-            if isinstance(data.get(key), list):
-                data = data[key]
+    if not response.ok:
+        try:
+            detail = response.json()
+        except ValueError:
+            detail = response.text
+        raise RuntimeError(
+            f"{response.status_code} {response.url}\n"
+            f"{json.dumps(detail, indent=2)}"
+        )
+    return response.json()
+
+
+def get(path, params=None, *, http_session=None):
+    """Perform a GET request against the API."""
+    return request_json("GET", path, params=params, http_session=http_session)
+
+
+def results(page):
+    """Return records from an API page, or an empty list if absent."""
+    return page.get("results", [])
+
+
+def frame(page_or_rows, columns=None):
+    """Convert API results or row records into a pandas DataFrame."""
+    rows = (
+        results(page_or_rows)
+        if isinstance(page_or_rows, dict) and "results" in page_or_rows
+        else page_or_rows
+    )
+    table = rows.copy() if isinstance(rows, pd.DataFrame) else pd.json_normalize(rows)
+    if columns:
+        table = table.reindex(columns=columns)
+    return table
+
+
+def get_decays(nuclide, params=None, *, http_session=None):
+    """Get decay records for a nuclide, returned as a DataFrame."""
+    symbol, mass, _ = parse_nuclide(nuclide)
+    path = f"/nuclides/{mass}{symbol}/decays"
+    return frame(get(path, params=params, http_session=http_session))
+
+
+def stream_ndjson(path, *, params, max_rows=None, timeout=300,
+                  http_session=None):
+    """Stream newline-delimited JSON records from the API."""
+    if max_rows is not None and max_rows <= 0:
+        return []
+    client = http_session or session
+    rows = []
+    with client.get(
+        api_url(path),
+        params=params,
+        stream=True,
+        timeout=timeout,
+        headers={"Accept": "application/x-ndjson"},
+    ) as response:
+        response.raise_for_status()
+        for line in response.iter_lines():
+            if not line:
+                continue
+            rows.append(json.loads(line))
+            if max_rows is not None and len(rows) >= max_rows:
                 break
-        else:
-            data = [data]
-    return pd.DataFrame(data)
+    return rows
 
 
-def get_levels(nuclide, session=None):
-    """DataFrame of adopted levels for a nuclide."""
-    return _fetch(LEVELS_ENDPOINT, nuclide, session)
+def get_gammas(max_rows=None, *, params=None, timeout=300, http_session=None):
+    """Get adopted gamma records from the API's NDJSON export."""
+    export_params = dict(GAMMA_EXPORT_PARAMS)
+    if params:
+        export_params.update(params)
+    return frame(
+        stream_ndjson(
+            GAMMA_EXPORT_PATH,
+            params=export_params,
+            max_rows=max_rows,
+            timeout=timeout,
+            http_session=http_session,
+        )
+    )
 
 
-def get_gammas(nuclide, session=None):
-    """DataFrame of gamma records for a nuclide."""
-    return _fetch(GAMMAS_ENDPOINT, nuclide, session)
+def get_gamma_energies_intensities(gammas=None, max_rows=None,
+                                   *, http_session=None):
+    """Return gamma energy (keV) and available intensity data as a DataFrame.
 
-
-def select_isomer(levels, isomer_index):
-    """Select the level row for the ground state (0) or the n-th isomer.
-
-    Isomers are the long-lived excited levels (those with a half-life), ordered
-    by energy. Expects columns 'energy' and 'half_life_seconds'.
+    If ``gammas`` is omitted, adopted gamma records are streamed from the API.
+    The export shown in the API example is not nuclide-filtered.
     """
-    levels = levels.sort_values("energy").reset_index(drop=True)
-    if isomer_index == 0:
-        return levels.iloc[0]
-    isomers = levels[(levels["energy"] > 0) & levels["half_life_seconds"].notna()]
-    if len(isomers) < isomer_index:
-        raise LookupError(f"Isomer m{isomer_index} not found")
-    return isomers.iloc[isomer_index - 1]
+    records = get_gammas(max_rows, http_session=http_session) if gammas is None else frame(gammas)
+    rows = []
+    for record in records.to_dict(orient="records"):
+        energy = record.get("energy")
+        energy_value = record.get("energy.value")
+        energy_unit = record.get("energy.unit")
+        if isinstance(energy, dict):
+            energy_value = energy.get("value")
+            energy_unit = energy.get("unit")
+        if energy_value is None:
+            continue
+        if energy_unit != "keV":
+            continue
+        intensity = record.get("intensity")
+        if intensity is None:
+            intensity = record.get("intensity.value")
+        if not isinstance(intensity, dict):
+            intensity = intensity if intensity is not None else record.get("relativeIntensity")
+        if isinstance(intensity, dict):
+            intensity = intensity.get("value")
+        rows.append({"energy": energy_value, "intensity": intensity})
+    return pd.DataFrame(rows, columns=["energy", "intensity"])
 
 
-def get_half_life(nuclide, session=None):
-    """Half-life in seconds of a nuclide, e.g. 'Co60' or 'Co60m'."""
+def get_half_life(nuclide, *, params=None, http_session=None):
+    """Return the half-life only when supplied in the nuclide decay records.
+
+    The API example provided documents the decays route but not a half-life
+    field, so this helper deliberately does not infer a value from level order.
+    """
     _, _, isomer = parse_nuclide(nuclide)
-    levels = get_levels(nuclide, session)
-    return float(select_isomer(levels, isomer)["half_life_seconds"])
-
-
-def get_gamma_energies_intensities(nuclide, session=None):
-    """DataFrame with 'energy' (keV) and 'intensity' columns, by energy."""
-    gammas = get_gammas(nuclide, session)
-    cols = [c for c in ("energy", "intensity") if c in gammas.columns]
-    return gammas[cols].sort_values("energy").reset_index(drop=True)
+    decays = get_decays(nuclide, params=params, http_session=http_session)
+    if decays.empty:
+        raise LookupError(f"No decay records found for {nuclide}")
+    half_life_fields = ("halfLife", "half-life", "half_life")
+    values = next((decays[field] for field in half_life_fields if field in decays), None)
+    if values is None:
+        raise LookupError("The decay records do not include a documented half-life field")
+    row_index = min(isomer, len(decays) - 1)
+    return values.iloc[row_index]
