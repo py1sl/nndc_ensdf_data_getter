@@ -110,6 +110,57 @@ def test_stream_ndjson_uses_export_accept_header_and_row_limit():
     assert kwargs["params"] == {"document-type": "adopted"}
 
 
+def test_get_levels_uses_adopted_levels_export_defaults():
+    client = FakeSession(lines=[
+        b'{"id":"L1","energy":{"value":58.6,"unit":"keV"},"halflifeSeconds":628}'
+    ])
+    levels = api.get_levels(max_rows=10, http_session=client)
+    assert levels.iloc[0]["id"] == "L1"
+    _, url, kwargs = client.calls[0]
+    assert url.endswith("/levels/export")
+    assert kwargs["params"] == {
+        "document-type": "adopted",
+        "energy-min": 0.001,
+        "has-halflife": True,
+    }
+
+
+def test_excited_state_half_lives_normalizes_and_filters_records():
+    levels = [
+        {
+            "id": "L1",
+            "datasetSummary": {"id": "D1"},
+            "energy": {"value": "58.6", "unit": "keV"},
+            "halflifeSeconds": "628",
+            "spinParity": {"stringRepresentation": "2+"},
+        },
+        {
+            "id": "L2",
+            "energy": {"value": 0, "unit": "keV"},
+            "halflifeSeconds": 10,
+        },
+        {
+            "id": "L3",
+            "energy": {"value": 1.0, "unit": "MeV"},
+            "halflifeSeconds": 10,
+        },
+        {
+            "id": "L4",
+            "energy": {"value": 10, "unit": "keV"},
+            "halflifeSeconds": 0,
+        },
+    ]
+    table = api.get_excited_state_half_lives(levels)
+    assert table.to_dict(orient="records") == [{
+        "levelId": "L1",
+        "datasetId": "D1",
+        "energy_keV": 58.6,
+        "energy_unit": "keV",
+        "halflife_s": 628,
+        "spinParity": "2+",
+    }]
+
+
 def test_gamma_energies_extracts_keV_and_nested_intensity():
     records = [
         {"energy": {"value": 1332.5, "unit": "keV"},

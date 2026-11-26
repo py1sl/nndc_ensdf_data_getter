@@ -11,6 +11,12 @@ BASE_URL = "https://www.nndc.bnl.gov/ensdf-api/"
 TIMEOUT = 60
 GAMMA_EXPORT_PATH = "/gammas/export"
 GAMMA_EXPORT_PARAMS = {"document-type": "adopted"}
+LEVEL_EXPORT_PATH = "/levels/export"
+LEVEL_EXPORT_PARAMS = {
+    "document-type": "adopted",
+    "energy-min": 0.001,
+    "has-halflife": True,
+}
 
 _NUCLIDE_RE = re.compile(r"^\s*(\d+)?\s*([A-Za-z]{1,2})[-\s]?(\d+)?\s*(m\d*)?\s*$")
 
@@ -127,6 +133,78 @@ def get_gammas(max_rows=None, *, params=None, timeout=300, http_session=None):
             http_session=http_session,
         )
     )
+
+
+def get_levels(max_rows=None, *, params=None, timeout=300, http_session=None):
+    """Get adopted levels with half-lives from the levels NDJSON export.
+
+    The export is not nuclide-filtered; it can contain many records.
+    """
+    export_params = dict(LEVEL_EXPORT_PARAMS)
+    if params:
+        export_params.update(params)
+    return frame(
+        stream_ndjson(
+            LEVEL_EXPORT_PATH,
+            params=export_params,
+            max_rows=max_rows,
+            timeout=timeout,
+            http_session=http_session,
+        )
+    )
+
+
+def get_excited_state_half_lives(levels=None, max_rows=None, *,
+                                 params=None, http_session=None):
+    """Return adopted excited levels with positive half-lives as a DataFrame.
+
+    Columns include ``levelId``, ``datasetId``, ``energy_keV``, ``halflife_s``,
+    and ``spinParity``. If ``levels`` is omitted, the API's global levels
+    export is streamed; it does not select a particular nuclide.
+    """
+    records = (
+        get_levels(max_rows, params=params, http_session=http_session)
+        if levels is None
+        else frame(levels)
+    )
+    rows = []
+    for level in records.to_dict(orient="records"):
+        energy = level.get("energy")
+        energy_value = level.get("energy.value")
+        energy_unit = level.get("energy.unit")
+        if isinstance(energy, dict):
+            energy_value = energy.get("value")
+            energy_unit = energy.get("unit")
+        dataset = level.get("datasetSummary")
+        dataset_id = level.get("datasetId")
+        if isinstance(dataset, dict):
+            dataset_id = dataset.get("id")
+        spin_parity = level.get("spinParity")
+        if isinstance(spin_parity, dict):
+            spin_parity = spin_parity.get("stringRepresentation")
+        rows.append({
+            "levelId": level.get("id", level.get("levelId")),
+            "datasetId": dataset_id,
+            "energy_keV": energy_value,
+            "energy_unit": energy_unit,
+            "halflife_s": level.get("halflifeSeconds", level.get("halflife_s")),
+            "spinParity": spin_parity,
+        })
+    table = pd.DataFrame(
+        rows,
+        columns=[
+            "levelId", "datasetId", "energy_keV", "energy_unit",
+            "halflife_s", "spinParity",
+        ],
+    )
+    table["energy_keV"] = pd.to_numeric(table["energy_keV"], errors="coerce")
+    table["halflife_s"] = pd.to_numeric(table["halflife_s"], errors="coerce")
+    return table.loc[
+        table["energy_unit"].eq("keV")
+        & table["energy_keV"].notna()
+        & table["energy_keV"].gt(0)
+        & table["halflife_s"].gt(0)
+    ].reset_index(drop=True)
 
 
 def get_gamma_energies_intensities(gammas=None, max_rows=None,
